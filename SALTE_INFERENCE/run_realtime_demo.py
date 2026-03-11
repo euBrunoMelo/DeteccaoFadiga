@@ -66,6 +66,13 @@ from .parallel import (
     PipelineResult,
     PipelineWorker,
 )
+from .agents import (
+    OcularAgent,
+    BlinkAgent,
+    PosturalAgent,
+    SupervisorAgent,
+    SupervisorConfig,
+)
 
 
 # ── FIX-RT-3: HeadPoseNeutralizer (C33) ─────────────────────────────────────
@@ -184,6 +191,7 @@ def run_realtime(
     log_features: bool = False,
     operator_id: str | None = None,
     parallel: bool = False,
+    no_agents: bool = False,
 ) -> None:
     """
     Loop realtime com calibração per-subject.
@@ -242,6 +250,19 @@ def run_realtime(
         enabled=log_features,
     )
     print(f"[init] Memory: SessionMemory + OperatorStore initialized")
+    # ─────────────────────────────────────────────────────────────────────
+
+    # ── Multi-Agent: Supervisor + 3 especialistas ──────────────────────
+    supervisor = None
+    if not no_agents:
+        ocular_agent = OcularAgent()
+        blink_agent = BlinkAgent()
+        postural_agent = PosturalAgent(pose_neutralized=neutralize_pose)
+        supervisor = SupervisorAgent(
+            ocular_agent, blink_agent, postural_agent,
+            SupervisorConfig(),
+        )
+        print("[init] Multi-Agent: Supervisor + 3 specialists initialized")
     # ─────────────────────────────────────────────────────────────────────
 
     # ── FIX-RT-3: inicializar neutralizer ────────────────────────────────
@@ -588,6 +609,24 @@ def run_realtime(
                 )
                 # ─────────────────────────────────────────────────────
 
+                # ── Multi-Agent: consultar Supervisor ─────────────────
+                supervisor_decision = None
+                if supervisor is not None:
+                    supervisor_decision = supervisor.decide(window_feats)
+
+                    if debug:
+                        print(f"[agents] MLP: {output.label} ({output.prob_danger:.3f})")
+                        print(f"[agents] Supervisor: {supervisor_decision.label} "
+                              f"({supervisor_decision.combined_score:.3f})")
+                        print(f"[agents] Type: {supervisor_decision.fatigue_type}")
+                        print(f"[agents] Dominant: {supervisor_decision.dominant_agent}")
+                        print(f"[agents] Agreement: {supervisor_decision.agent_agreement:.2f}")
+                        for op in supervisor_decision.opinions:
+                            print(f"[agents]   {op.agent_name}: {op.signal.name} "
+                                  f"(score={op.score:.3f}, conf={op.confidence:.2f})")
+                            print(f"[agents]     → {op.reasoning}")
+                # ─────────────────────────────────────────────────────
+
                 status_text = (
                     f"{output.label} ({output.prob_danger:.2f}) "
                     f"[{output.confidence}]"
@@ -604,6 +643,9 @@ def run_realtime(
                     f"Microsleeps:{output.microsleep_count:.1f} "
                     f"Alert:{output.alert_level.name}"
                 )
+                if (supervisor_decision is not None
+                        and supervisor_decision.fatigue_type != "none"):
+                    overlay2 += f" Type:{supervisor_decision.fatigue_type}"
 
                 print(
                     f"[window] label={output.label} "
@@ -806,6 +848,10 @@ def main() -> None:
         "--parallel", action="store_true",
         help="Ativar captura paralela via FrameGrabber (thread separada)",
     )
+    parser.add_argument(
+        "--no-agents", action="store_true",
+        help="Desativar análise multi-agente (usar apenas MLP)",
+    )
     # ────────────────────────────────────────────────────────────────────
     args = parser.parse_args()
 
@@ -832,6 +878,7 @@ def main() -> None:
         log_features=args.log_features,
         operator_id=args.operator_id,
         parallel=args.parallel,
+        no_agents=args.no_agents,
     )
 
 
