@@ -2,12 +2,18 @@
 Loop principal de inferência em tempo real com calibração per-subject.
 
 V2: ONNXFaceMeshBackend, best_model.onnx (19 features), inference_config.json.
-Pipeline: picamera2/cv2 -> ONNXFaceMesh -> features -> scale_features (JSON) -> MLP -> Safe/Danger.
+V3: FIX-RT-3 — HeadPoseNeutralizer (C33): zera 4 features de head pose
+    para tornar o modelo agnóstico a pose em produção. Toggleável via
+    --no-neutralize-pose para testes A/B com dados de lab.
+
+Pipeline: picamera2/cv2 -> ONNXFaceMesh -> features -> scale_features (JSON)
+          -> HeadPoseNeutralizer -> MLP V3 -> Safe/Danger.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import time
 from pathlib import Path
 from typing import Optional, Union
@@ -39,6 +45,71 @@ from .subject_calibrator_rt import (
     RTSubjectCalibrator,
 )
 from .window_factory_rt import OnlineWindowFactory, RTWindowConfig
+from . import guardrails
+from .guardrails import (
+    AlertLevel,
+    BehaviorGuardRails,
+    validate_calibration,
+)
+from .reflection import (
+    AutoRecalibrationManager,
+    DriftReflector,
+    DriftStatus,
+    PredictionReflector,
+)
+
+
+# ── FIX-RT-3: HeadPoseNeutralizer (C33) ─────────────────────────────────────
+
+
+class HeadPoseNeutralizer:
+    """
+    FIX-RT-3: Neutraliza features de head pose para deploy em produção.
+
+    Zera as 4 features de pose no vetor escalonado (z-score=0 = centro da
+    distribuição de treino), tornando a classificação 100% dependente das
+    15 features oculares/blink.
+
+    ORDEM CRÍTICA: aplicar DEPOIS do SelectiveScaler para que o valor
+    final seja exatamente 0.0.  Se aplicado ANTES, o scaler computa
+    (0 - mean) / std ≠ 0, quebrando a neutralização.
+
+    Toggleável via ``enabled`` para testes A/B (--no-neutralize-pose).
+
+    Features neutralizadas (índices 4-7 em FEATURE_NAMES_21):
+        pitch_mean, pitch_std, yaw_std, roll_std
+
+    Ref: SALTE_COMPLETE_HISTORY §Bug #2, FeatureFactoryV4.md §4.2.
+    Constraint: C33 — Head Pose Neutralization.
+    """
+
+    POSE_FEATURE_NAMES = {"pitch_mean", "pitch_std", "yaw_std", "roll_std"}
+
+    def __init__(self, feature_names: list[str], enabled: bool = True) -> None:
+        self.enabled = enabled
+        self._pose_indices = [
+            i for i, name in enumerate(feature_names)
+            if name in self.POSE_FEATURE_NAMES
+        ]
+        if enabled and self._pose_indices:
+            print(
+                f"[neutralizer] Zeroing {len(self._pose_indices)} pose "
+                f"features at indices {self._pose_indices}"
+            )
+        elif enabled and not self._pose_indices:
+            print(
+                "[neutralizer] WARNING: nenhuma feature de pose encontrada "
+                "em feature_names — neutralizer é no-op"
+            )
+
+    def neutralize(self, vec: np.ndarray) -> np.ndarray:
+        """Zera features de pose in-place (cópia). Retorna vetor modificado."""
+        if not self.enabled:
+            return vec
+        v = vec.copy()
+        for idx in self._pose_indices:
+            v[idx] = 0.0
+        return v
 
 
 # ── PiCamera2 capture wrapper ───────────────────────────────────────────────
@@ -100,6 +171,7 @@ def run_realtime(
     fps: int = 30,
     headless: bool = False,
     debug: bool = False,
+    neutralize_pose: bool = True,
 ) -> None:
     """
     Loop realtime com calibração per-subject.
@@ -107,6 +179,11 @@ def run_realtime(
     Fases:
     1. WARM-UP: coleta frames por warmup_sec segundos
     2. CALIBRATED: inferência com Safe/Danger overlay
+
+    Args:
+        neutralize_pose: Se True (default), zera as 4 features de head pose
+            após o scaler, tornando a predição agnóstica a pose (C33).
+            Desativar com --no-neutralize-pose para testes com dados de lab.
     """
     model_dir = Path(checkpoint_path).parent
     if config_path is None:
@@ -120,8 +197,29 @@ def run_realtime(
     threshold = threshold_override if threshold_override is not None else config.threshold
     feature_names = config.feature_names
 
+    # ── Guardrails + Reflection: carregar training_stats e inicializar ────
+    with open(str(config_path), encoding="utf-8") as _f:
+        _raw_config = json.load(_f)
+    training_stats = _raw_config.get("training_stats", {})
+
+    behavior_guard = BehaviorGuardRails()
+    drift_reflector = DriftReflector(training_stats)
+    pred_reflector = PredictionReflector()
+    recal_manager = AutoRecalibrationManager()
+    print("[init] Guardrails + Reflection: initialized")
+    # ─────────────────────────────────────────────────────────────────────
+
+    # ── FIX-RT-3: inicializar neutralizer ────────────────────────────────
+    neutralizer = HeadPoseNeutralizer(
+        feature_names=feature_names,
+        enabled=neutralize_pose,
+    )
+    if not neutralize_pose:
+        print("[init] HeadPoseNeutralizer: DISABLED (--no-neutralize-pose)")
+    # ─────────────────────────────────────────────────────────────────────
+
     print(f"[init] Scaler: JSON (inference_config)")
-    print(f"[init] Threshold: {threshold} (19 features)")
+    print(f"[init] Threshold: {threshold} ({len(feature_names)} features)")
 
     try:
         backend = ONNXFaceMeshBackend(
@@ -195,6 +293,31 @@ def run_realtime(
 
                 if calibrator.is_calibrated:
                     b = calibrator.baseline
+
+                    # ── G4: Validar qualidade da calibração ───────────
+                    verdict = validate_calibration(b)
+
+                    if verdict.recommendation == "retry":
+                        print(
+                            f"[guardrail] Calibração REJEITADA: "
+                            f"{verdict.issues}"
+                        )
+                        print("[guardrail] Reiniciando warm-up...")
+                        calibrator = RTSubjectCalibrator(
+                            CalibrationConfig(
+                                fps=fps, search_sec=warmup_sec
+                            )
+                        )
+                        continue
+
+                    if verdict.recommendation == "use_with_caution":
+                        print(
+                            "[guardrail] Calibração ACEITA com ressalvas:"
+                        )
+                        for issue in verdict.issues:
+                            print(f"  [guardrail] {issue}")
+                    # ──────────────────────────────────────────────────
+
                     print("[calibration] Baseline computed!")
                     print(
                         f"[calibration]   EAR:   mean={b.ear_mean:.4f}, "
@@ -238,6 +361,7 @@ def run_realtime(
                         f"{b.segment_start}-{b.segment_end}"
                     )
 
+                    behavior_guard.on_calibration_complete()
                     window_factory.set_perclos_baseline(b.ear_mean)
                 else:
                     if not headless:
@@ -271,10 +395,11 @@ def run_realtime(
                 )
 
                 if debug:
-                    print("\n[debug] Raw 19-feature vector:")
+                    print("\n[debug] Raw feature vector:")
                     for i, name in enumerate(feature_names):
                         print(f"  {name:30s} = {vec_raw[i]:12.6f}")
 
+                # ── 1. Scaler PRIMEIRO ───────────────────────────────
                 vec = scale_features(vec_raw, config)
 
                 if debug:
@@ -282,27 +407,120 @@ def run_realtime(
                     for i, name in enumerate(feature_names):
                         print(f"  {name:30s} = {vec[i]:12.6f}")
 
+                # ── 2. FIX-RT-3: Neutralizar DEPOIS do scaler (C33) ─
+                vec = neutralizer.neutralize(vec)
+
+                if debug and neutralizer.enabled:
+                    print("[debug] After HeadPoseNeutralizer:")
+                    for i, name in enumerate(feature_names):
+                        print(f"  {name:30s} = {vec[i]:12.6f}")
+                # ─────────────────────────────────────────────────────
+
+                # ── 3. Predição ──────────────────────────────────────
                 prob_danger, label = predict_fatigue(
                     vec, model, config, threshold_override=threshold
                 )
-                status_text = f"{label} ({prob_danger:.2f})"
-                color = (0, 0, 255) if label == "Danger" else (0, 255, 0)
 
-                perclos = window_feats.get("perclos_p80_mean", 0.0)
-                blink_count = window_feats.get("blink_count", 0.0)
-                micros = window_feats.get("microsleep_count", 0.0)
+                # ── 4. Guardrails: validar e empacotar saída ─────────
+                output = guardrails.validate_and_wrap(
+                    prob_danger=prob_danger,
+                    label=label,
+                    window_feats=window_feats,
+                    feature_names=feature_names,
+                    config=config,
+                    timestamp_ms=calibrated.timestamp_ms,
+                    threshold=threshold,
+                )
+                output = behavior_guard.process(output)
+
+                # ── 5. Reflection: drift + predição ──────────────────
+                drift_report = drift_reflector.push_window(window_feats)
+                reflection = pred_reflector.push(prob_danger, label)
+
+                if reflection.pattern != "stable":
+                    print(
+                        f"[reflection] Padrão: {reflection.pattern} | "
+                        f"{reflection.suggestion}"
+                    )
+
+                if reflection.confidence_modifier < 1.0:
+                    output.confidence = "low"
+
+                if drift_report is not None:
+                    if drift_report.status != DriftStatus.STABLE:
+                        print(
+                            f"[reflection] Drift {drift_report.status.value}: "
+                            f"{drift_report.drifted_features}"
+                        )
+                        print(
+                            f"[reflection] Z-scores: "
+                            f"{drift_report.details}"
+                        )
+                        print(
+                            f"[reflection] Recomendação: "
+                            f"{drift_report.recommendation}"
+                        )
+
+                    # ── 6. Auto-recalibração ─────────────────────────
+                    recal_decision = recal_manager.evaluate(
+                        drift_report=drift_report,
+                        pred_reflection=reflection,
+                    )
+
+                    if recal_decision.should_recalibrate:
+                        print(
+                            f"[reflection] AUTO-RECALIBRAÇÃO: "
+                            f"{recal_decision.reason} "
+                            f"(urgência: {recal_decision.urgency})"
+                        )
+
+                        if recal_decision.urgency == "immediate":
+                            calibrator = RTSubjectCalibrator(
+                                CalibrationConfig(
+                                    fps=fps, search_sec=60.0
+                                )
+                            )
+                            window_factory = OnlineWindowFactory(
+                                RTWindowConfig(fps=fps)
+                            )
+                            drift_reflector = DriftReflector(
+                                training_stats
+                            )
+                            pred_reflector = PredictionReflector()
+                            behavior_guard.on_calibration_complete()
+                # ─────────────────────────────────────────────────────
+
+                # Sound alert with rate limiting
+                if behavior_guard.should_sound_alert(output):
+                    # Placeholder: acionar buzzer / som (GPIO ou beep)
+                    print("[alert] SOUND ALERT triggered")
+
+                status_text = (
+                    f"{output.label} ({output.prob_danger:.2f}) "
+                    f"[{output.confidence}]"
+                )
+                color = (0, 0, 255) if output.label == "Danger" else (0, 255, 0)
+                if output.alert_level == AlertLevel.CRITICAL:
+                    color = (0, 0, 200)  # dark red for critical
+                elif output.alert_level == AlertLevel.WATCH:
+                    color = (0, 165, 255)  # orange for watch
+
                 overlay2 = (
-                    f"PERCLOS:{perclos:.2f} "
-                    f"BlinkCount:{blink_count:.1f} "
-                    f"Microsleeps:{micros:.1f}"
+                    f"PERCLOS:{output.perclos:.2f} "
+                    f"BlinkCount:{output.blink_count:.1f} "
+                    f"Microsleeps:{output.microsleep_count:.1f} "
+                    f"Alert:{output.alert_level.name}"
                 )
 
                 print(
-                    f"[window] label={label} prob={prob_danger:.3f} "
+                    f"[window] label={output.label} "
+                    f"prob={output.prob_danger:.3f} "
+                    f"alert={output.alert_level.name} "
                     f"ear_mean_z={window_feats.get('ear_mean', 0.0):.3f} "
-                    f"perclos={perclos:.3f} "
-                    f"blinks={blink_count:.0f} "
-                    f"microsleeps={micros:.0f}"
+                    f"perclos={output.perclos:.3f} "
+                    f"blinks={output.blink_count:.0f} "
+                    f"microsleeps={output.microsleep_count:.0f} "
+                    f"confidence={output.confidence}"
                 )
 
             if not headless:
@@ -399,7 +617,7 @@ def _draw_inference_overlay(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="SALTE Realtime Fatigue Detection (V2)",
+        description="SALTE Realtime Fatigue Detection (V3 — HeadPoseNeutralizer)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -453,8 +671,15 @@ def main() -> None:
     )
     parser.add_argument(
         "--debug", action="store_true",
-        help="Print 19-feature vector for each window",
+        help="Print feature vector for each window (raw, scaled, neutralized)",
     )
+    # ── FIX-RT-3: CLI toggle (C33) ──────────────────────────────────────
+    parser.add_argument(
+        "--no-neutralize-pose", action="store_true",
+        help="Desativar neutralização de head pose (para testes com dados de lab). "
+             "Default: neutralização ATIVADA (4 features de pose zeradas).",
+    )
+    # ────────────────────────────────────────────────────────────────────
     args = parser.parse_args()
 
     model_dir = Path(args.model_dir)
@@ -476,6 +701,7 @@ def main() -> None:
         fps=args.fps,
         headless=args.headless,
         debug=args.debug,
+        neutralize_pose=not args.no_neutralize_pose,
     )
 
 

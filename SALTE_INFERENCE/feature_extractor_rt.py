@@ -4,16 +4,17 @@ Extrator de features em tempo real inspirado na FeatureFactoryV5.
 V2: Suporta ONNXFaceMeshBackend (BlazeFace + FaceMesh ONNX) para RPi 5
 sem dependência do pacote mediapipe.
 
-Objetivo:
-- Fornecer uma API de alto nível para receber frames (np.ndarray BGR/RGB)
-  e manter um buffer interno de sinais frame-a-frame semelhantes aos
-  produzidos pela FFV5 (EAR, MAR, head pose, flags de face, etc.).
+V2.1 (FIX-RT-1): HeadPoseSanitizer — porta causal do sanitize_head_pose()
+da FFV5 (linhas 684-720) para operação frame-a-frame com ring buffers.
+Corrige PnP flip (pitch_std=131° → <15°).
+Ref: FeatureFactoryV4.md §4.2, SALTE_COMPLETE_HISTORY Bug #2, FFV5 C18.
 
 Dependências: OpenCV, numpy, onnxruntime
 """
 
 from __future__ import annotations
 
+from collections import deque  # NOVO — FIX-RT-1
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Protocol, Tuple
@@ -112,9 +113,7 @@ FACE_3D_MODEL = np.array(
 
 
 def compute_mar_from_landmarks(landmarks: np.ndarray) -> float:
-    """
-    MAR aproximado em coordenadas normalizadas, espelhando a fórmula da FFV5.
-    """
+    """MAR aproximado em coordenadas normalizadas, espelhando a fórmula da FFV5."""
 
     def _pt(idx: int) -> np.ndarray:
         return np.asarray(landmarks[idx], dtype=np.float64)
@@ -131,9 +130,7 @@ def compute_head_pose_from_landmarks(
     frame_width: int,
     frame_height: int,
 ) -> Tuple[float, float, float]:
-    """
-    Head pose aproximado via solvePnP, inspirado na implementação da FFV5.
-    """
+    """Head pose aproximado via solvePnP, inspirado na implementação da FFV5."""
     img_pts = np.array(
         [
             [landmarks[idx][0] * frame_width, landmarks[idx][1] * frame_height]
@@ -174,9 +171,168 @@ def compute_head_pose_from_landmarks(
     return float(pitch), float(yaw), float(roll)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# FIX-RT-1: HeadPoseSanitizer
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Porta causal do sanitize_head_pose() da FFV5 (ffv5.py, C18) para operação
+# frame-a-frame com ring buffers.
+#
+# Três passos idênticos ao offline:
+#   1. Flip unwrap    — |pitch| > 90° → correção de ambiguidade PnP
+#   2. Median filter  — ring buffer k=5, causal (sem lookahead)
+#   3. Spike removal  — |Δ| > 30°/frame → hold last valid (max 3 frames)
+#
+# Diferenças RT vs Offline (FFV5):
+#   - Median: rolling(k=5, center=True) bidirecional → deque(maxlen=5) causal
+#   - Spike:  np.diff + interpolação linear → comparação frame anterior, hold
+#   - NaN:    pd.interpolate(limit=3) → hold last valid (max 3 frames)
+#
+# Parâmetros idênticos à FFV5:
+#   - head_flip_threshold_deg  = 90.0  (cfg.head_flip_threshold_deg)
+#   - head_median_kernel       = 5     (cfg.head_median_kernel)
+#   - head_spike_threshold_deg = 30.0  (cfg.head_spike_threshold_deg)
+#
+# Ref: FeatureFactoryV4.md §4.2, SALTE_COMPLETE_HISTORY Bug #2.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class HeadPoseSanitizer:
+    """
+    FIX-RT-1: Porta sanitize_head_pose() da FFV5 para operação causal.
+
+    Três passos idênticos ao offline:
+      1. Flip unwrap    — |pitch| > flip_thresh → correção de ambiguidade PnP
+      2. Median filter  — ring buffer k=median_k, causal (sem lookahead)
+      3. Spike removal  — |Δ| > spike_thresh/frame → hold last valid
+
+    Parâmetros idênticos à FFV5 (ffv5.py linhas 106-108).
+    Ref: FeatureFactoryV4.md §4.2, SALTE_COMPLETE_HISTORY Bug #2.
+    """
+
+    def __init__(
+        self,
+        flip_thresh: float = 90.0,
+        median_k: int = 5,
+        spike_thresh: float = 30.0,
+    ) -> None:
+        self._flip_thresh = flip_thresh
+        self._median_k = median_k
+        self._spike_thresh = spike_thresh
+
+        # Ring buffers para median causal (sem lookahead)
+        self._pitch_buf: deque = deque(maxlen=median_k)
+        self._yaw_buf: deque = deque(maxlen=median_k)
+        self._roll_buf: deque = deque(maxlen=median_k)
+
+        # Last valid para spike hold
+        self._prev: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self._hold_count: int = 0
+
+    def sanitize(
+        self, pitch: float, yaw: float, roll: float
+    ) -> Tuple[float, float, float]:
+        """
+        Aplica os 3 passos de sanitização causal.
+
+        Deve ser chamado uma vez por frame, imediatamente após solvePnP
+        e antes de emitir RTFrameFeatures.
+
+        Returns:
+            (pitch_clean, yaw_clean, roll_clean) em graus.
+        """
+        # ── Step 1: Flip unwrap (idêntico à FFV5, frame-level) ──
+        p, y, r = self._flip_unwrap(pitch, yaw, roll)
+
+        # ── Step 2: Median filter (causal, sem lookahead) ────────
+        self._pitch_buf.append(p)
+        self._yaw_buf.append(y)
+        self._roll_buf.append(r)
+        p = float(np.median(self._pitch_buf))
+        y = float(np.median(self._yaw_buf))
+        r = float(np.median(self._roll_buf))
+
+        # ── Step 3: Spike removal (hold last valid, max 3) ──────
+        p, y, r = self._spike_check(p, y, r)
+
+        return p, y, r
+
+    def _flip_unwrap(
+        self, p: float, y: float, r: float
+    ) -> Tuple[float, float, float]:
+        """
+        Step 1: Corrige ambiguidade PnP quando |pitch| > flip_thresh.
+
+        Lógica idêntica à FFV5:
+          - pitch flipped:  sign(p)*180 - p
+          - roll flipped:   sign(r)*180 - r
+          - yaw offset:     y + (-180 se y>0 else +180)
+        Seguido de unwrap de yaw/roll para [-90, +90].
+        """
+        if abs(p) > self._flip_thresh:
+            p = np.sign(p) * 180.0 - p
+            r = np.sign(r) * 180.0 - r
+            y = y + (-180.0 if y > 0 else 180.0)
+
+        # Unwrap yaw/roll para [-90, +90] (FFV5 Step 1b)
+        if y > 90:
+            y -= 180
+        elif y < -90:
+            y += 180
+        if r > 90:
+            r -= 180
+        elif r < -90:
+            r += 180
+
+        return float(p), float(y), float(r)
+
+    def _spike_check(
+        self, p: float, y: float, r: float
+    ) -> Tuple[float, float, float]:
+        """
+        Step 3: Spike removal causal.
+
+        Se qualquer eixo muda > spike_thresh num frame, mantém o valor
+        anterior por até 3 frames consecutivos. Após 3 holds, aceita
+        o novo valor (equivalente ao limit=3 da interpolação offline).
+        """
+        pp, py, pr = self._prev
+        dp = abs(p - pp)
+        dy = abs(y - py)
+        dr = abs(r - pr)
+        is_spike = (
+            dp > self._spike_thresh
+            or dy > self._spike_thresh
+            or dr > self._spike_thresh
+        )
+
+        if is_spike and self._hold_count < 3:
+            self._hold_count += 1
+            return pp, py, pr  # hold last valid
+
+        # Aceita novo valor (ou hold expirou após 3 frames)
+        self._hold_count = 0
+        self._prev = (p, y, r)
+        return p, y, r
+
+    def reset(self) -> None:
+        """Reseta estado interno. Chamar ao trocar de vídeo/sessão."""
+        self._pitch_buf.clear()
+        self._yaw_buf.clear()
+        self._roll_buf.clear()
+        self._prev = (0.0, 0.0, 0.0)
+        self._hold_count = 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+
+
 class RealTimeFeatureExtractor:
     """
     Extrator de features em tempo real aproximado da FFV5.
+
+    V2.1: Integra HeadPoseSanitizer (FIX-RT-1) no pipeline,
+    imediatamente após solvePnP e antes de emitir RTFrameFeatures.
     """
 
     def __init__(
@@ -188,6 +344,8 @@ class RealTimeFeatureExtractor:
         self.cfg = config or RTExtractorConfig()
         self._frame_idx = 0
         self._prev_ear_avg: float = 0.0
+        # ── FIX-RT-1: HeadPoseSanitizer ──────────────────────────
+        self._pose_sanitizer = HeadPoseSanitizer()
 
     def process_frame(self, frame_bgr: np.ndarray) -> RTFrameFeatures:
         h, w = frame_bgr.shape[:2]
@@ -216,9 +374,14 @@ class RealTimeFeatureExtractor:
             ear_velocity = (ear_avg - self._prev_ear_avg) * self.cfg.fps
             mar = compute_mar_from_landmarks(landmarks)
 
-            pitch, yaw, roll = compute_head_pose_from_landmarks(
+            # ── FIX-RT-1: solvePnP → HeadPoseSanitizer → features ──
+            pitch_raw, yaw_raw, roll_raw = compute_head_pose_from_landmarks(
                 landmarks, frame_width=w, frame_height=h
             )
+            pitch, yaw, roll = self._pose_sanitizer.sanitize(
+                pitch_raw, yaw_raw, roll_raw
+            )
+            # ─────────────────────────────────────────────────────────
 
             feats = RTFrameFeatures(
                 timestamp_ms=self._frame_idx * (1000.0 / self.cfg.fps),
@@ -240,10 +403,7 @@ class RealTimeFeatureExtractor:
 
 
 class DummyBackend:
-    """
-    Backend de landmarks de exemplo.
-    Não detecta nada – serve para testes de integração.
-    """
+    """Backend de landmarks de exemplo. Não detecta nada – testes de integração."""
 
     def process(
         self, frame_bgr: np.ndarray
@@ -274,8 +434,8 @@ class ONNXFaceMeshBackend:
 
     BLAZEFACE_INPUT_SIZE = 128
     FACEMESH_INPUT_SIZE = 256
-    FACEMESH_NUM_LANDMARKS = 468  # MediaPipe 468 mesh (usar primeiros 468 de 478)
-    CROP_MARGIN = 0.25  # 25% margin para FaceMesh (padrão MediaPipe)
+    FACEMESH_NUM_LANDMARKS = 468
+    CROP_MARGIN = 0.25
 
     def __init__(
         self,
@@ -306,14 +466,13 @@ class ONNXFaceMeshBackend:
         if h == 0 or w == 0:
             return None, False
 
-        # 1. BlazeFace: detecta face
         bbox = self._detect_face(frame_bgr)
         if bbox is None:
             return None, False
 
         x1, y1, x2, y2 = bbox
 
-        # 2. Expand bbox com margin (25%)
+        # Expand bbox com margin (25%)
         bw = x2 - x1
         bh = y2 - y1
         pad_w = bw * self.CROP_MARGIN
@@ -323,7 +482,6 @@ class ONNXFaceMeshBackend:
         x2 = min(w, x2 + pad_w)
         y2 = min(h, y2 + pad_h)
 
-        # 3. Crop e resize para FaceMesh (256x256)
         crop = frame_bgr[int(y1) : int(y2), int(x1) : int(x2)]
         if crop.size == 0:
             return None, False
@@ -338,18 +496,13 @@ class ONNXFaceMeshBackend:
             1, self.FACEMESH_INPUT_SIZE, self.FACEMESH_INPUT_SIZE, 3
         )
 
-        # 4. FaceMesh inference
         mesh_out = self._mesh.run(None, {self._mesh_input_name: mesh_in})[0]
-        # mesh_out shape: (1, 1, 1, 1434) -> 478*3; usamos 468*3
         flat = mesh_out[0, 0, 0, : self.FACEMESH_NUM_LANDMARKS * 3]
         lms_crop = flat.reshape(self.FACEMESH_NUM_LANDMARKS, 3)
 
-        # 5. Coordenadas no crop (256x256): x,y em [0,256], z ignorado
-        # Normalizar para [0,1] no crop
         x_crop = lms_crop[:, 0] / self.FACEMESH_INPUT_SIZE
         y_crop = lms_crop[:, 1] / self.FACEMESH_INPUT_SIZE
 
-        # 6. Transformar para coordenadas do frame original [0,1]
         crop_w_orig = float(x2 - x1)
         crop_h_orig = float(y2 - y1)
         x_frame = (x1 + x_crop * crop_w_orig) / w
@@ -358,7 +511,9 @@ class ONNXFaceMeshBackend:
         landmarks = np.stack([x_frame, y_frame], axis=1).astype(np.float32)
         return landmarks, True
 
-    def _detect_face(self, frame_bgr: np.ndarray) -> Optional[Tuple[float, float, float, float]]:
+    def _detect_face(
+        self, frame_bgr: np.ndarray
+    ) -> Optional[Tuple[float, float, float, float]]:
         """Roda BlazeFace e retorna bbox (x1,y1,x2,y2) em coords de frame, ou None."""
         h, w = frame_bgr.shape[:2]
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -378,13 +533,10 @@ class ONNXFaceMeshBackend:
             return None
 
         r = reg[0, best_idx, :]
-        # MediaPipe BlazeFace: reg em pixel space (128x128)
-        # Formato típico: [x_center, y_center, width, height, kp1_x, kp1_y, ...]
         xc = float(r[0])
         yc = float(r[1])
         bw = float(r[2])
         bh = float(r[3])
-        # clamp tamanhos mínimos
         bw = max(bw, 8.0)
         bh = max(bh, 8.0)
         x1_128 = max(0, xc - bw / 2)
@@ -392,7 +544,6 @@ class ONNXFaceMeshBackend:
         x2_128 = min(self.BLAZEFACE_INPUT_SIZE, xc + bw / 2)
         y2_128 = min(self.BLAZEFACE_INPUT_SIZE, yc + bh / 2)
 
-        # Escalar para frame original
         scale_x = w / self.BLAZEFACE_INPUT_SIZE
         scale_y = h / self.BLAZEFACE_INPUT_SIZE
         x1 = x1_128 * scale_x

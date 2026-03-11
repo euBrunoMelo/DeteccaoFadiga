@@ -1,21 +1,23 @@
 """
-Versão online do WindowFactory da TEV7 para uso em tempo real.
+Versao online do WindowFactory da TEV7 para uso em tempo real.
 
 Atualizado para usar CalibratedFrame (Z-Norm per-subject).
 
-Correções aplicadas:
+Correcoes aplicadas:
 - FIX 1: EAR velocity computada sobre EAR RAW suavizado (median filter kernel=5)
 - FIX 2: PERCLOS baseline = mean EAR do best-segment (alinha com FFV5 offline)
-- FIX 3: Blink velocity onset = local max PRÉ-blink no sinal suavizado
+- FIX 3: Blink velocity onset = local max PRE-blink no sinal suavizado
 - FIX 4: Microsleep filters (median, blink overlap, purity)
-- FIX 5: C22 clamp rebaixado de 50→5 EAR/s (limite fisiológico humano)
-- FIX 6: perclos_p80_max = pico de rolling 5s (não max binário — era sempre 1.0!)
+- FIX 5: C22 clamp rebaixado de 50->5 EAR/s (limite fisiologico humano)
+- FIX 6: perclos_p80_max = pico de rolling 5s (nao max binario -- era sempre 1.0!)
+- FIX-RT-2: Z-Score Clamp [-3, +3] em features Z-normed (C32)
 
 Respeita:
 - C5:  Z-Norm per subject para EAR/MAR/pose stats
 - C13: PERCLOS sobre EAR raw (nunca Z-normalizado)
 - C21: Velocidades em EAR/s
-- C22: Bounded derived features (blink_vel ∈ [0.01, 5])
+- C22: Bounded derived features (blink_vel in [0.01, 5])
+- C32: Z-Score Clamp RT -- features Z-normed bounded [-3, +3]
 """
 
 from __future__ import annotations
@@ -35,16 +37,22 @@ class RTWindowConfig:
     window_sec: float = 15.0
     stride_infer: int = 60
     min_valid_ratio: float = 0.80
-    # Fator PERCLOS: offline FFV5 usa 0.80 (FHWA P80), mas assume calibração e
-    # operação no mesmo domínio (motorista dirigindo). No RT com webcam, a
-    # calibração captura pico de alerta (olhos bem abertos) e a operação é mais
-    # relaxada — gap de ~20% no EAR. Fator 0.65 compensa esse domain shift.
+    # Fator PERCLOS: offline FFV5 usa 0.80 (FHWA P80), mas assume calibracao e
+    # operacao no mesmo dominio (motorista dirigindo). No RT com webcam, a
+    # calibracao captura pico de alerta (olhos bem abertos) e a operacao e mais
+    # relaxada -- gap de ~20% no EAR. Fator 0.65 compensa esse domain shift.
     perclos_factor: float = 0.65
+    # FIX-RT-2 (C32): Clamp Z-scores em [-zscore_clamp, +zscore_clamp].
+    # Protege contra drift de camera/iluminacao que empurra Z-scores para
+    # valores fora do range de treino. +/-3 sigma cobre 99.7% da distribuicao
+    # normal; ear_z=-3 ainda e sinal forte de Danger (olho muito fechado vs
+    # baseline).
+    zscore_clamp: float = 3.0
 
 
 class OnlineWindowFactory:
     """
-    OnlineWindowFactory mantém um buffer de CalibratedFrames e,
+    OnlineWindowFactory mantem um buffer de CalibratedFrames e,
     periodicamente, produz uma janela agregada com 19 features (TEV7 Agentic V3).
 
     Usa:
@@ -66,7 +74,7 @@ class OnlineWindowFactory:
         Define o baseline EAR para PERCLOS a partir do calibrador.
 
         FIX 2 alinhado com FFV5 offline: deve receber ear_mean do best-segment
-        (não P90). Threshold final = ear_baseline * 0.8 (FHWA P80).
+        (nao P90). Threshold final = ear_baseline * 0.8 (FHWA P80).
         """
         self._perclos_baseline_ear = ear_baseline
 
@@ -87,9 +95,9 @@ class OnlineWindowFactory:
         Adiciona um CalibratedFrame ao buffer.
 
         Retorna:
-        - Um dicionário {feature_name: valor} quando uma nova janela
-          agregada estiver disponível.
-        - None caso contrário.
+        - Um dicionario {feature_name: valor} quando uma nova janela
+          agregada estiver disponivel.
+        - None caso contrario.
         """
         self._buffer.append(frame)
         if len(self._buffer) > self.window_frames:
@@ -115,14 +123,28 @@ class OnlineWindowFactory:
         if valid_ratio < self.cfg.min_valid_ratio:
             return None
 
-        # ── Z-Normed arrays (para EAR stats, MAR stats, head pose) ──
+        # -- Z-Normed arrays (para EAR stats, MAR stats, head pose) --
         ear_z = np.array([f.ear_avg_znorm for f in window], dtype=np.float32)
         mar_z = np.array([f.mar_znorm for f in window], dtype=np.float32)
         pitch_z = np.array([f.head_pitch_znorm for f in window], dtype=np.float32)
         yaw_z = np.array([f.head_yaw_znorm for f in window], dtype=np.float32)
         roll_z = np.array([f.head_roll_znorm for f in window], dtype=np.float32)
 
-        # ── Raw arrays (para EAR velocity, PERCLOS, blinks) ──
+        # -- FIX-RT-2: Z-Score Clamp (C32) --------------------------------
+        # Protege contra drift de camera/iluminacao que empurra Z-scores
+        # para valores fora do range de treino do modelo. ear_z=-3 ainda
+        # e forte sinal de Danger; pitch_z=+3 ainda captura head drop.
+        # Features raw (PERCLOS, blinks, microsleeps) NAO sao afetadas --
+        # operam sobre ear_raw, nunca sobre Z-norm (C13 preservado).
+        ZSCORE_CLAMP = self.cfg.zscore_clamp
+        ear_z = np.clip(ear_z, -ZSCORE_CLAMP, ZSCORE_CLAMP)
+        mar_z = np.clip(mar_z, -ZSCORE_CLAMP, ZSCORE_CLAMP)
+        pitch_z = np.clip(pitch_z, -ZSCORE_CLAMP, ZSCORE_CLAMP)
+        yaw_z = np.clip(yaw_z, -ZSCORE_CLAMP, ZSCORE_CLAMP)
+        roll_z = np.clip(roll_z, -ZSCORE_CLAMP, ZSCORE_CLAMP)
+        # ------------------------------------------------------------------
+
+        # -- Raw arrays (para EAR velocity, PERCLOS, blinks) --
         ear_raw = np.array([f.ear_avg_raw for f in window], dtype=np.float32)
 
         # FIX 1+5: Median filter remove spikes de landmark jitter (1-2 frames)
@@ -132,41 +154,41 @@ class OnlineWindowFactory:
 
         feats: Dict[str, float] = {}
 
-        # ═══ Grupo 1: EAR stats (Z-Normed) ═══
+        # === Grupo 1: EAR stats (Z-Normed, clampado C32) ===
         feats["ear_mean"] = float(ear_z.mean())
         feats["ear_std"] = float(ear_z.std())
         feats["ear_min"] = float(ear_z.min())
 
-        # ═══ Grupo 2: EAR velocity (RAW suavizado — FIX 1) ═══
+        # === Grupo 2: EAR velocity (RAW suavizado -- FIX 1) ===
         ear_vel_raw = np.diff(ear_smooth, prepend=ear_smooth[0]) * self.cfg.fps
         feats["ear_vel_mean"] = float(ear_vel_raw.mean())
         feats["ear_vel_std"] = float(ear_vel_raw.std())
 
-        # ═══ Grupo 3: MAR (Z-Normed) ═══
+        # === Grupo 3: MAR (Z-Normed, clampado C32) ===
         feats["mar_mean"] = float(mar_z.mean())
 
-        # ═══ Grupo 4: Head pose (Z-Normed) ═══
+        # === Grupo 4: Head pose (Z-Normed, clampado C32) ===
         feats["pitch_mean"] = float(pitch_z.mean())
         feats["pitch_std"] = float(pitch_z.std())
         feats["yaw_std"] = float(yaw_z.std())
         feats["roll_std"] = float(roll_z.std())
 
-        # ═══ Grupo 5-7: Blink stats (RAW + smooth — C13, FIX 3+5) ═══
+        # === Grupo 5-7: Blink stats (RAW + smooth -- C13, FIX 3+5) ===
         blink_stats = self._compute_blink_stats(ear_raw, ear_smooth)
         feats.update(blink_stats)
 
-        # ═══ Grupo 6: PERCLOS (RAW — C13, FIX 2) ═══
+        # === Grupo 6: PERCLOS (RAW -- C13, FIX 2) ===
         perclos_stats, micro_stats = self._compute_perclos_and_microsleeps(
             ear_raw, ear_smooth, face_mask
         )
         feats.update(perclos_stats)
-        feats.update(micro_stats)  # para overlay/logging; NÃO vai no vetor do modelo
+        feats.update(micro_stats)  # para overlay/logging; NAO vai no vetor do modelo
 
-        # Validação: todas as 19 features de modelo devem existir
+        # Validacao: todas as 19 features de modelo devem existir
         missing = [f for f in FEATURE_NAMES_19 if f not in feats]
         if missing:
             raise RuntimeError(
-                f"WindowFactoryRT não preencheu todas as features: "
+                f"WindowFactoryRT nao preencheu todas as features: "
                 f"faltando {missing}"
             )
 
@@ -176,14 +198,14 @@ class OnlineWindowFactory:
         self, ear_raw: np.ndarray, ear_smooth: np.ndarray
     ) -> Dict[str, float]:
         """
-        Detecção de blinks usando EAR RAW (C13).
+        Deteccao de blinks usando EAR RAW (C13).
 
-        FIX 3: Blink velocity usa o local max PRÉ-blink como onset real,
+        FIX 3: Blink velocity usa o local max PRE-blink como onset real,
         computado sobre ear_smooth para evitar que jitter de landmark
-        gere velocidades espúrias.
+        gere velocidades espurias.
 
         FIX 5: Velocities clampadas em [0.01, 5] EAR/s (C22).
-        Limite fisiológico: blink humano ≈ 2-4 EAR/s.
+        Limite fisiologico: blink humano ~ 2-4 EAR/s.
         """
         fps = self.cfg.fps
         window_sec = len(ear_raw) / max(fps, 1)
@@ -268,7 +290,7 @@ class OnlineWindowFactory:
             opening_frames = max(offset_frame - peak_frame, 1)
             opening_vel = abs(ear_offset - ear_peak) / (opening_frames / max(fps, 1))
 
-            # FIX 5: clamp fisiológico [0.01, 5] EAR/s
+            # FIX 5: clamp fisiologico [0.01, 5] EAR/s
             closing_vel = float(np.clip(closing_vel, 0.01, 5.0))
             opening_vel = float(np.clip(opening_vel, 0.01, 5.0))
 
@@ -311,8 +333,8 @@ class OnlineWindowFactory:
         PERCLOS P80 e microsleeps usando EAR RAW (C13 + C25).
 
         FIX 2 (alinhado com FFV5 offline): baseline = mean EAR do best-segment
-        de calibração. Threshold = baseline * 0.8 (FHWA P80).
-        Fallback se não calibrado: P90 intra-janela.
+        de calibracao. Threshold = baseline * 0.8 (FHWA P80).
+        Fallback se nao calibrado: P90 intra-janela.
 
         FIX 4: Microsleeps filtrados com median filter, blink overlap, purity.
         """
@@ -336,10 +358,10 @@ class OnlineWindowFactory:
 
         fps = self.cfg.fps
 
-        # perclos_p80_mean: fração de frames fechados na janela inteira
+        # perclos_p80_mean: fracao de frames fechados na janela inteira
         perclos_mean = float(np.nanmean(closed_f))
 
-        # FIX 6: perclos_p80_max = pico da rolling average (NÃO max binário!)
+        # FIX 6: perclos_p80_max = pico da rolling average (NAO max binario!)
         sub_sec = 5.0
         sub_frames = max(int(sub_sec * fps), 1)
         if len(closed_f) >= sub_frames:
@@ -355,7 +377,7 @@ class OnlineWindowFactory:
         microsleeps = 0
         total_ms = 0.0
 
-        # ear_smooth já vem pré-computado (FIX 1)
+        # ear_smooth ja vem pre-computado (FIX 1)
         closed_smooth = (ear_smooth < threshold) & valid
 
         if closed_smooth.any():
@@ -364,7 +386,7 @@ class OnlineWindowFactory:
             starts = np.where(diff == 1)[0]
             ends = np.where(diff == -1)[0]
 
-            # (b) Coletar intervalos de blinks detectados para exclusão
+            # (b) Coletar intervalos de blinks detectados para exclusao
             # Blinks: segmentos curtos (< 500ms) de olho fechado no sinal raw
             blink_intervals = []
             closed_raw = (ear_raw < threshold) & valid
@@ -375,7 +397,7 @@ class OnlineWindowFactory:
                 b_ends = np.where(bd == -1)[0]
                 for bs, be in zip(b_starts.tolist(), b_ends.tolist()):
                     dur = be - bs
-                    if 2 <= dur < min_frames:  # blink: 2 frames até < 500ms
+                    if 2 <= dur < min_frames:  # blink: 2 frames ate < 500ms
                         blink_intervals.append((bs, be))
 
             for s, e in zip(starts.tolist(), ends.tolist()):
@@ -383,8 +405,8 @@ class OnlineWindowFactory:
                 if length < min_frames:
                     continue
 
-                # (b) Verificar se o segmento é apenas blinks concatenados
-                # Se > 50% do segmento se sobrepõe com blinks, descartar
+                # (b) Verificar se o segmento e apenas blinks concatenados
+                # Se > 50% do segmento se sobrepe com blinks, descartar
                 blink_overlap = 0
                 for bs, be in blink_intervals:
                     overlap_start = max(s, bs)
