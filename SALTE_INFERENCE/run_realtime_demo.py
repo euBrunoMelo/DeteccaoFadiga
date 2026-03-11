@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Union
 
@@ -56,6 +57,14 @@ from .reflection import (
     DriftReflector,
     DriftStatus,
     PredictionReflector,
+)
+from .memory import FeatureLogger, OperatorStore, SessionMemory
+from .parallel import (
+    FrameGrabber,
+    FrameGrabberConfig,
+    PerformanceMonitor,
+    PipelineResult,
+    PipelineWorker,
 )
 
 
@@ -172,6 +181,9 @@ def run_realtime(
     headless: bool = False,
     debug: bool = False,
     neutralize_pose: bool = True,
+    log_features: bool = False,
+    operator_id: str | None = None,
+    parallel: bool = False,
 ) -> None:
     """
     Loop realtime com calibração per-subject.
@@ -207,6 +219,29 @@ def run_realtime(
     pred_reflector = PredictionReflector()
     recal_manager = AutoRecalibrationManager()
     print("[init] Guardrails + Reflection: initialized")
+    # ─────────────────────────────────────────────────────────────────────
+
+    # ── Memory: SessionMemory + OperatorStore + FeatureLogger ─────────
+    _op_id = operator_id or f"op-{camera_index}"
+    session = SessionMemory(operator_id=_op_id)
+    session_started_at = datetime.now().isoformat()
+
+    op_store = OperatorStore(db_path=str(model_dir / "operator_memory.db"))
+
+    # Check warm-start
+    warm_baseline = op_store.get_warm_start_baseline(_op_id)
+    if warm_baseline is not None:
+        print(f"[memory] Warm-start disponível para {_op_id}")
+        print(f"[memory]   EAR histórico: {warm_baseline['ear_mean']:.4f}")
+        warmup_sec = 30.0
+
+    feat_logger = FeatureLogger(
+        output_dir=str(model_dir / "logs"),
+        feature_names=feature_names,
+        operator_id=_op_id,
+        enabled=log_features,
+    )
+    print(f"[init] Memory: SessionMemory + OperatorStore initialized")
     # ─────────────────────────────────────────────────────────────────────
 
     # ── FIX-RT-3: inicializar neutralizer ────────────────────────────────
@@ -256,11 +291,32 @@ def run_realtime(
 
     frame_interval = 1.0 / max(fps, 1)
 
+    # ── Parallel: FrameGrabber + PerformanceMonitor ───────────────────
+    grabber: Optional[FrameGrabber] = None
+    perf_monitor: Optional[PerformanceMonitor] = None
+    if parallel:
+        grabber = FrameGrabber(
+            cap, FrameGrabberConfig(target_fps=fps),
+        )
+        grabber.start()
+        perf_monitor = PerformanceMonitor(report_interval_sec=30.0)
+        print("[init] Parallel: FrameGrabber + PerformanceMonitor enabled")
+    # ─────────────────────────────────────────────────────────────────
+
     try:
         while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
+            if grabber is not None:
+                frame = grabber.get_frame(timeout=0.1)
+                if frame is None:
+                    continue
+                if perf_monitor is not None:
+                    perf_monitor.on_capture()
+            else:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+            session.total_frames += 1
 
             feats = extractor.process_frame(frame)
 
@@ -362,6 +418,16 @@ def run_realtime(
                     )
 
                     behavior_guard.on_calibration_complete()
+
+                    # ── Memory: registrar calibração ──────────────────
+                    session.on_calibration(
+                        b.ear_mean, verdict.recommendation,
+                    )
+                    op_store.upsert_profile_from_calibration(
+                        _op_id, b,
+                    )
+                    # ──────────────────────────────────────────────────
+
                     window_factory.set_perclos_baseline(b.ear_mean)
                 else:
                     if not headless:
@@ -474,6 +540,8 @@ def run_realtime(
                             f"(urgência: {recal_decision.urgency})"
                         )
 
+                        session.on_auto_recalibration()
+
                         if recal_decision.urgency == "immediate":
                             calibrator = RTSubjectCalibrator(
                                 CalibrationConfig(
@@ -491,9 +559,34 @@ def run_realtime(
                 # ─────────────────────────────────────────────────────
 
                 # Sound alert with rate limiting
-                if behavior_guard.should_sound_alert(output):
-                    # Placeholder: acionar buzzer / som (GPIO ou beep)
+                alert_triggered = behavior_guard.should_sound_alert(
+                    output
+                )
+                if alert_triggered:
                     print("[alert] SOUND ALERT triggered")
+                session.on_alert(triggered=alert_triggered)
+
+                # ── Memory: registrar janela ─────────────────────────
+                session.on_window(
+                    label=output.label,
+                    prob_danger=output.prob_danger,
+                    alert_level_name=output.alert_level.name,
+                    perclos=output.perclos,
+                    ear_mean=window_feats.get("ear_mean", 0.0),
+                    microsleep_count=output.microsleep_count,
+                    microsleep_total_ms=window_feats.get(
+                        "microsleep_total_ms", 0.0
+                    ),
+                )
+                feat_logger.log(
+                    timestamp_ms=output.timestamp_ms,
+                    label=output.label,
+                    prob_danger=output.prob_danger,
+                    alert_level=output.alert_level.name,
+                    confidence=output.confidence,
+                    window_feats=window_feats,
+                )
+                # ─────────────────────────────────────────────────────
 
                 status_text = (
                     f"{output.label} ({output.prob_danger:.2f}) "
@@ -529,14 +622,35 @@ def run_realtime(
                     overlay2, calibrator, calibrated,
                 )
                 cv2.imshow("SALTE Realtime Demo", frame)
+                if perf_monitor is not None:
+                    perf_monitor.on_display()
+
+            # ── Perf: periodic report ─────────────────────────────────
+            if perf_monitor is not None and grabber is not None:
+                perf_monitor.maybe_report(
+                    grabber.stats,
+                    {"avg_process_ms": 0, "frames_processed": 0},
+                )
+            # ──────────────────────────────────────────────────────────
 
             if key == ord("q"):
                 break
 
     finally:
+        if grabber is not None:
+            grabber.stop()
         cap.release()
         if not headless:
             cv2.destroyAllWindows()
+
+        # ── Memory: salvar sessão e fechar ────────────────────────────
+        summary = session.summary()
+        print(f"[session] Resumo final: {summary}")
+        op_store.save_session(_op_id, summary, session_started_at)
+        op_store.close()
+        feat_logger.close()
+        print(f"[memory] Sessão salva para {_op_id}")
+        # ──────────────────────────────────────────────────────────────
 
 
 # ── Overlay drawing helpers ──────────────────────────────────────────────────
@@ -679,6 +793,19 @@ def main() -> None:
         help="Desativar neutralização de head pose (para testes com dados de lab). "
              "Default: neutralização ATIVADA (4 features de pose zeradas).",
     )
+    # ── Memory + Parallel ────────────────────────────────────────────
+    parser.add_argument(
+        "--log-features", action="store_true",
+        help="Gravar features de cada janela em CSV para retraining",
+    )
+    parser.add_argument(
+        "--operator-id", type=str, default=None,
+        help="Operator ID for session tracking and warm-start",
+    )
+    parser.add_argument(
+        "--parallel", action="store_true",
+        help="Ativar captura paralela via FrameGrabber (thread separada)",
+    )
     # ────────────────────────────────────────────────────────────────────
     args = parser.parse_args()
 
@@ -702,6 +829,9 @@ def main() -> None:
         headless=args.headless,
         debug=args.debug,
         neutralize_pose=not args.no_neutralize_pose,
+        log_features=args.log_features,
+        operator_id=args.operator_id,
+        parallel=args.parallel,
     )
 
 

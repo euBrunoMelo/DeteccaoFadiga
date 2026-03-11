@@ -8,6 +8,8 @@ Módulos:
 - model_loader: best_model.onnx, inference_config.json (scaler via JSON)
 - guardrails: Validação estruturada de saída, entrada, calibração e comportamento (G1-G4)
 - reflection: Detecção de drift, crítico de predição, auto-recalibração (R1-R3)
+- memory: Memória de curto prazo (SessionMemory), longo prazo (OperatorStore), logger (M1-M3)
+- parallel: Captura paralela (FrameGrabber), worker (PipelineWorker), métricas (P1-P3)
 - run_realtime_demo: Loop principal câmera → Safe/Danger (picamera2 / webcam)
 - offline_eval: Ferramentas de validação offline (dev-only, requer scikit-learn)
 """

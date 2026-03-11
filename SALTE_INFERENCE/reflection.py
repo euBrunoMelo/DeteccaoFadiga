@@ -345,7 +345,7 @@ class AutoRecalibrationManager:
         self._min_interval = min_recal_interval_sec
         self._max_per_hour = max_recalibrations_per_hour
         self._recal_timestamps: List[float] = []
-        self._last_recal_time: float = 0.0
+        self._last_recal_time: float = -(min_recal_interval_sec + 1.0)
 
     def evaluate(
         self,

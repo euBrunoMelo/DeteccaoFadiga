@@ -204,7 +204,7 @@ class BehaviorGuardRails:
         self, config: Optional[BehaviorGuardrailConfig] = None
     ) -> None:
         self.cfg = config or BehaviorGuardrailConfig()
-        self._last_alert_time: float = 0.0
+        self._last_alert_time: float = -(self.cfg.alert_cooldown_sec + 1.0)
         self._last_inference_time: float = time.monotonic()
         self._windows_since_calibration: int = 0
         self._consecutive_danger: int = 0
