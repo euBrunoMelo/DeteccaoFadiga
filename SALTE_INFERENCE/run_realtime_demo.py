@@ -14,10 +14,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 
 import cv2
 import numpy as np
@@ -170,6 +171,280 @@ class PiCamera2Capture:
             self._opened = False
 
 
+# ── P2: process_fn factory (closure) ──────────────────────────────────────────
+
+
+def _build_process_fn(
+    *,
+    extractor: RealTimeFeatureExtractor,
+    calibrator: RTSubjectCalibrator,
+    window_factory: OnlineWindowFactory,
+    model,
+    config,
+    neutralizer: HeadPoseNeutralizer,
+    threshold: float,
+    feature_names: list,
+    behavior_guard: BehaviorGuardRails,
+    drift_reflector: DriftReflector,
+    pred_reflector: PredictionReflector,
+    recal_manager: AutoRecalibrationManager,
+    supervisor,  # Optional[SupervisorAgent]
+    session: SessionMemory,
+    feat_logger: FeatureLogger,
+    op_store: OperatorStore,
+    operator_id: str,
+    training_stats: dict,
+    fps: int,
+    warmup_sec: float,
+    min_warmup_sec: float,
+    debug: bool,
+    force_calibrate_event: threading.Event,
+) -> Callable[[np.ndarray], PipelineResult]:
+    """
+    Constrói a process_fn para o PipelineWorker via closure.
+
+    Todos os objetos stateful (extractor, calibrator, window_factory,
+    behavior_guard, drift_reflector, etc.) ficam capturados na closure.
+    Como o PipelineWorker chama process_fn de uma ÚNICA thread worker,
+    o acesso serial a esses objetos é garantido — sem race conditions.
+
+    A main thread NÃO acessa nenhum desses objetos diretamente.
+    A comunicação é exclusivamente via PipelineResult (output queue).
+    """
+
+    def process_fn(frame: np.ndarray) -> PipelineResult:
+        nonlocal calibrator, window_factory, drift_reflector, pred_reflector
+
+        session.total_frames += 1
+        feats = extractor.process_frame(frame)
+
+        raw_text = (
+            f"EAR:{feats.ear_avg:.3f} "
+            f"MAR:{feats.mar:.3f} "
+            f"Face:{int(feats.face_detected)}"
+        )
+
+        # ── Checar se main thread pediu force calibrate ──
+        if force_calibrate_event.is_set():
+            force_calibrate_event.clear()
+            if not calibrator.is_calibrated:
+                elapsed = len(calibrator._warmup_buffer) / fps
+                if elapsed >= min_warmup_sec:
+                    calibrator.force_calibrate()
+                    print(f"[calibration] Forced at {elapsed:.0f}s")
+
+        # ── Warm-up phase ──
+        if not calibrator.is_calibrated:
+            calibrated = calibrator.push(feats)
+            progress = calibrator.warmup_progress
+
+            if calibrator.is_calibrated:
+                b = calibrator.baseline
+                verdict = validate_calibration(b)
+
+                if verdict.recommendation == "retry":
+                    print(f"[guardrail] Calibração REJEITADA: {verdict.issues}")
+                    print("[guardrail] Reiniciando warm-up...")
+                    calibrator = RTSubjectCalibrator(
+                        CalibrationConfig(fps=fps, search_sec=warmup_sec)
+                    )
+                    return PipelineResult(
+                        frame=frame, raw_text=raw_text,
+                        status_text="Recalibrating...",
+                        color=(0, 200, 255), overlay2="",
+                        is_warmup=True, warmup_progress=0.0,
+                        warmup_elapsed=0.0,
+                    )
+
+                if verdict.recommendation == "use_with_caution":
+                    print("[guardrail] Calibração ACEITA com ressalvas:")
+                    for issue in verdict.issues:
+                        print(f"  [guardrail] {issue}")
+
+                print("[calibration] Baseline computed!")
+                print(
+                    f"[calibration]   EAR: mean={b.ear_mean:.4f}, "
+                    f"std={b.ear_std:.4f}"
+                )
+
+                behavior_guard.on_calibration_complete()
+                session.on_calibration(b.ear_mean, verdict.recommendation)
+                op_store.upsert_profile_from_calibration(operator_id, b)
+                window_factory.set_perclos_baseline(b.ear_mean)
+
+                if calibrated is None:
+                    calibrated = calibrator.calibrate(feats)
+            else:
+                elapsed = len(calibrator._warmup_buffer) / fps
+                return PipelineResult(
+                    frame=frame, raw_text=raw_text,
+                    status_text="Calibrating...",
+                    color=(0, 200, 255), overlay2="",
+                    is_warmup=True,
+                    warmup_progress=progress,
+                    warmup_elapsed=elapsed,
+                )
+        else:
+            calibrated = calibrator.calibrate(feats)
+
+        # ── Z-norm text for display ──
+        znorm_text = ""
+        if calibrated is not None:
+            znorm_text = (
+                f"EAR_z:{calibrated.ear_avg_znorm:.2f} "
+                f"MAR_z:{calibrated.mar_znorm:.2f} "
+                f"Pitch_z:{calibrated.head_pitch_znorm:.2f}"
+            )
+
+        # ── Window aggregation ──
+        window_feats = window_factory.push(calibrated)
+
+        status_text = "Calibrated - waiting for window..."
+        color = (255, 255, 255)
+        overlay2 = ""
+        output = None
+
+        if window_feats is not None:
+            vec_raw = np.array(
+                [window_feats[name] for name in feature_names],
+                dtype=np.float32,
+            )
+            vec = scale_features(vec_raw, config)
+            vec = neutralizer.neutralize(vec)
+
+            prob_danger, label = predict_fatigue(
+                vec, model, config, threshold_override=threshold
+            )
+
+            # Guardrails (G1-G3)
+            output = guardrails.validate_and_wrap(
+                prob_danger=prob_danger, label=label,
+                window_feats=window_feats,
+                feature_names=feature_names,
+                config=config,
+                timestamp_ms=calibrated.timestamp_ms,
+                threshold=threshold,
+            )
+            output = behavior_guard.process(output)
+
+            # Reflection (R1-R3)
+            drift_report = drift_reflector.push_window(window_feats)
+            reflection = pred_reflector.push(prob_danger, label)
+
+            if reflection.pattern != "stable":
+                print(
+                    f"[reflection] Padrão: {reflection.pattern} | "
+                    f"{reflection.suggestion}"
+                )
+            if reflection.confidence_modifier < 1.0:
+                output.confidence = "low"
+
+            if drift_report is not None:
+                if drift_report.status != DriftStatus.STABLE:
+                    print(
+                        f"[reflection] Drift {drift_report.status.value}: "
+                        f"{drift_report.drifted_features}"
+                    )
+
+                recal_decision = recal_manager.evaluate(
+                    drift_report=drift_report,
+                    pred_reflection=reflection,
+                )
+                if recal_decision.should_recalibrate:
+                    print(
+                        f"[reflection] AUTO-RECALIBRAÇÃO: "
+                        f"{recal_decision.reason} "
+                        f"(urgência: {recal_decision.urgency})"
+                    )
+                    session.on_auto_recalibration()
+                    if recal_decision.urgency == "immediate":
+                        calibrator = RTSubjectCalibrator(
+                            CalibrationConfig(fps=fps, search_sec=60.0)
+                        )
+                        window_factory = OnlineWindowFactory(
+                            RTWindowConfig(fps=fps)
+                        )
+                        drift_reflector = DriftReflector(training_stats)
+                        pred_reflector = PredictionReflector()
+                        behavior_guard.on_calibration_complete()
+
+            # Alerts
+            alert_triggered = behavior_guard.should_sound_alert(output)
+            if alert_triggered:
+                print("[alert] SOUND ALERT triggered")
+            session.on_alert(triggered=alert_triggered)
+
+            # Memory
+            session.on_window(
+                label=output.label,
+                prob_danger=output.prob_danger,
+                alert_level_name=output.alert_level.name,
+                perclos=output.perclos,
+                ear_mean=window_feats.get("ear_mean", 0.0),
+                microsleep_count=output.microsleep_count,
+                microsleep_total_ms=window_feats.get(
+                    "microsleep_total_ms", 0.0
+                ),
+            )
+            feat_logger.log(
+                timestamp_ms=output.timestamp_ms,
+                label=output.label,
+                prob_danger=output.prob_danger,
+                alert_level=output.alert_level.name,
+                confidence=output.confidence,
+                window_feats=window_feats,
+            )
+
+            # Multi-Agent
+            supervisor_decision = None
+            if supervisor is not None:
+                supervisor_decision = supervisor.decide(window_feats)
+                if debug:
+                    print(f"[agents] MLP: {output.label} ({output.prob_danger:.3f})")
+                    print(f"[agents] Supervisor: {supervisor_decision.label}")
+
+            # Build overlay strings
+            status_text = (
+                f"{output.label} ({output.prob_danger:.2f}) "
+                f"[{output.confidence}]"
+            )
+            color = (0, 0, 255) if output.label == "Danger" else (0, 255, 0)
+            if output.alert_level == AlertLevel.CRITICAL:
+                color = (0, 0, 200)
+            elif output.alert_level == AlertLevel.WATCH:
+                color = (0, 165, 255)
+
+            overlay2 = (
+                f"PERCLOS:{output.perclos:.2f} "
+                f"BlinkCount:{output.blink_count:.1f} "
+                f"Microsleeps:{output.microsleep_count:.1f} "
+                f"Alert:{output.alert_level.name}"
+            )
+            if (supervisor_decision is not None
+                    and supervisor_decision.fatigue_type != "none"):
+                overlay2 += f" Type:{supervisor_decision.fatigue_type}"
+
+            print(
+                f"[window] label={output.label} "
+                f"prob={output.prob_danger:.3f} "
+                f"alert={output.alert_level.name}"
+            )
+
+        return PipelineResult(
+            frame=frame,
+            raw_text=raw_text,
+            status_text=status_text,
+            color=color,
+            overlay2=overlay2,
+            output=output,
+            window_feats=window_feats,
+            znorm_text=znorm_text,
+            is_calibrated=calibrator.is_calibrated,
+        )
+
+    return process_fn
+
+
 # ── Main realtime loop ───────────────────────────────────────────────────────
 
 
@@ -312,387 +587,460 @@ def run_realtime(
 
     frame_interval = 1.0 / max(fps, 1)
 
-    # ── Parallel: FrameGrabber + PerformanceMonitor ───────────────────
-    grabber: Optional[FrameGrabber] = None
-    perf_monitor: Optional[PerformanceMonitor] = None
+    # ── Sinais inter-thread ──────────────────────────────────────────
+    force_calibrate_event = threading.Event()
+    # ─────────────────────────────────────────────────────────────────
+
     if parallel:
+        # ── PARALLEL MODE: FrameGrabber + PipelineWorker + PerformanceMonitor ──
         grabber = FrameGrabber(
             cap, FrameGrabberConfig(target_fps=fps),
         )
         grabber.start()
         perf_monitor = PerformanceMonitor(report_interval_sec=30.0)
-        print("[init] Parallel: FrameGrabber + PerformanceMonitor enabled")
-    # ─────────────────────────────────────────────────────────────────
 
-    try:
-        while True:
-            if grabber is not None:
+        process_fn = _build_process_fn(
+            extractor=extractor,
+            calibrator=calibrator,
+            window_factory=window_factory,
+            model=model,
+            config=config,
+            neutralizer=neutralizer,
+            threshold=threshold,
+            feature_names=feature_names,
+            behavior_guard=behavior_guard,
+            drift_reflector=drift_reflector,
+            pred_reflector=pred_reflector,
+            recal_manager=recal_manager,
+            supervisor=supervisor,
+            session=session,
+            feat_logger=feat_logger,
+            op_store=op_store,
+            operator_id=_op_id,
+            training_stats=training_stats,
+            fps=fps,
+            warmup_sec=warmup_sec,
+            min_warmup_sec=min_warmup_sec,
+            debug=debug,
+            force_calibrate_event=force_calibrate_event,
+        )
+
+        worker = PipelineWorker(process_fn=process_fn, queue_size=2)
+        worker.start()
+        print("[init] Parallel: FrameGrabber + PipelineWorker + PerformanceMonitor started")
+
+        try:
+            last_result: Optional[PipelineResult] = None
+
+            while True:
+                # 1. Grab frame (from FrameGrabber thread)
                 frame = grabber.get_frame(timeout=0.1)
-                if frame is None:
-                    continue
-                if perf_monitor is not None:
+                if frame is not None:
                     perf_monitor.on_capture()
-            else:
+                    worker.put_frame(frame)
+
+                # 2. Get processed result (non-blocking)
+                result = worker.get_result(timeout=0.005)
+                if result is not None:
+                    perf_monitor.on_process_complete(
+                        worker.avg_process_time_ms
+                    )
+                    last_result = result
+
+                # 3. Display (always show latest result)
+                if not headless and last_result is not None:
+                    if last_result.is_warmup:
+                        _draw_warmup_overlay(
+                            last_result.frame,
+                            last_result.warmup_progress,
+                            warmup_sec,
+                            last_result.warmup_elapsed,
+                            last_result.raw_text,
+                        )
+                    else:
+                        _draw_inference_overlay_parallel(
+                            last_result.frame,
+                            last_result.status_text,
+                            last_result.color,
+                            last_result.raw_text,
+                            last_result.overlay2,
+                            last_result.znorm_text,
+                            last_result.is_calibrated,
+                        )
+                    cv2.imshow("SALTE Realtime Demo", last_result.frame)
+                    perf_monitor.on_display()
+
+                # 4. Keyboard input (main thread only)
+                if not headless:
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord("c"):
+                        force_calibrate_event.set()
+                    elif key == ord("q"):
+                        break
+                else:
+                    time.sleep(0.005)
+
+                # 5. Performance report (with REAL worker stats)
+                perf_monitor.maybe_report(
+                    grabber.stats,
+                    worker.stats,
+                )
+
+        finally:
+            worker.stop()
+            grabber.stop()
+            cap.release()
+            if not headless:
+                cv2.destroyAllWindows()
+
+            # ── Memory: salvar sessão e fechar ────────────────────────
+            summary = session.summary()
+            print(f"[session] Resumo final: {summary}")
+            op_store.save_session(_op_id, summary, session_started_at)
+            op_store.close()
+            feat_logger.close()
+            print(f"[memory] Sessão salva para {_op_id}")
+            # ──────────────────────────────────────────────────────────
+
+    else:
+        # ── SERIAL MODE (código original, backward-compatible) ─────────
+        try:
+            while True:
                 ret, frame = cap.read()
                 if not ret:
                     break
 
-            session.total_frames += 1
+                session.total_frames += 1
 
-            feats = extractor.process_frame(frame)
+                feats = extractor.process_frame(frame)
 
-            raw_text = (
-                f"EAR:{feats.ear_avg:.3f} "
-                f"MAR:{feats.mar:.3f} "
-                f"Face:{int(feats.face_detected)}"
-            )
+                raw_text = (
+                    f"EAR:{feats.ear_avg:.3f} "
+                    f"MAR:{feats.mar:.3f} "
+                    f"Face:{int(feats.face_detected)}"
+                )
 
-            if not headless:
-                key = cv2.waitKey(1) & 0xFF
-            else:
-                key = 0
-                time.sleep(frame_interval)
-
-            if not calibrator.is_calibrated:
-                calibrated = calibrator.push(feats)
-                progress = calibrator.warmup_progress
-
-                if key == ord("c"):
-                    elapsed = len(calibrator._warmup_buffer) / fps
-                    if elapsed >= min_warmup_sec:
-                        calibrator.force_calibrate()
-                        print(f"[calibration] Forced at {elapsed:.0f}s")
-                    else:
-                        print(
-                            f"[calibration] Need at least {min_warmup_sec}s "
-                            f"(current: {elapsed:.0f}s)"
-                        )
-
-                if calibrator.is_calibrated:
-                    b = calibrator.baseline
-
-                    # ── G4: Validar qualidade da calibração ───────────
-                    verdict = validate_calibration(b)
-
-                    if verdict.recommendation == "retry":
-                        print(
-                            f"[guardrail] Calibração REJEITADA: "
-                            f"{verdict.issues}"
-                        )
-                        print("[guardrail] Reiniciando warm-up...")
-                        calibrator = RTSubjectCalibrator(
-                            CalibrationConfig(
-                                fps=fps, search_sec=warmup_sec
-                            )
-                        )
-                        continue
-
-                    if verdict.recommendation == "use_with_caution":
-                        print(
-                            "[guardrail] Calibração ACEITA com ressalvas:"
-                        )
-                        for issue in verdict.issues:
-                            print(f"  [guardrail] {issue}")
-                    # ──────────────────────────────────────────────────
-
-                    print("[calibration] Baseline computed!")
-                    print(
-                        f"[calibration]   EAR:   mean={b.ear_mean:.4f}, "
-                        f"std={b.ear_std:.4f}"
-                    )
-                    print(
-                        f"[calibration]   EAR P90 (debug): {b.ear_p90_raw:.4f}"
-                    )
-                    pf = window_factory.cfg.perclos_factor
-                    print(
-                        f"[calibration]   PERCLOS baseline (=ear_mean): "
-                        f"{b.ear_mean:.4f}"
-                    )
-                    print(
-                        f"[calibration]   PERCLOS factor: {pf} "
-                        f"(offline=0.80, RT=0.65)"
-                    )
-                    print(
-                        f"[calibration]   PERCLOS threshold "
-                        f"(mean*{pf}): {b.ear_mean * pf:.4f}"
-                    )
-                    print(
-                        f"[calibration]   MAR:   mean={b.mar_mean:.4f}, "
-                        f"std={b.mar_std:.4f}"
-                    )
-                    print(
-                        f"[calibration]   Pitch: mean={b.pitch_mean:.2f}, "
-                        f"std={b.pitch_std:.2f}"
-                    )
-                    print(
-                        f"[calibration]   Yaw:   mean={b.yaw_mean:.2f}, "
-                        f"std={b.yaw_std:.2f}"
-                    )
-                    print(
-                        f"[calibration]   Roll:  mean={b.roll_mean:.2f}, "
-                        f"std={b.roll_std:.2f}"
-                    )
-                    print(f"[calibration]   Valid: {b.is_valid}")
-                    print(
-                        f"[calibration]   Segment: frames "
-                        f"{b.segment_start}-{b.segment_end}"
-                    )
-
-                    behavior_guard.on_calibration_complete()
-
-                    # ── Memory: registrar calibração ──────────────────
-                    session.on_calibration(
-                        b.ear_mean, verdict.recommendation,
-                    )
-                    op_store.upsert_profile_from_calibration(
-                        _op_id, b,
-                    )
-                    # ──────────────────────────────────────────────────
-
-                    window_factory.set_perclos_baseline(b.ear_mean)
+                if not headless:
+                    key = cv2.waitKey(1) & 0xFF
                 else:
-                    if not headless:
-                        _draw_warmup_overlay(
-                            frame, progress, warmup_sec,
-                            len(calibrator._warmup_buffer) / fps,
-                            raw_text,
-                        )
-                        cv2.imshow("SALTE Realtime Demo", frame)
+                    key = 0
+                    time.sleep(frame_interval)
 
-                    if key == ord("q"):
-                        break
-                    continue
+                if not calibrator.is_calibrated:
+                    calibrated = calibrator.push(feats)
+                    progress = calibrator.warmup_progress
 
-                if calibrated is None:
-                    calibrated = calibrator.calibrate(feats)
+                    if key == ord("c"):
+                        elapsed = len(calibrator._warmup_buffer) / fps
+                        if elapsed >= min_warmup_sec:
+                            calibrator.force_calibrate()
+                            print(f"[calibration] Forced at {elapsed:.0f}s")
+                        else:
+                            print(
+                                f"[calibration] Need at least {min_warmup_sec}s "
+                                f"(current: {elapsed:.0f}s)"
+                            )
 
-            else:
-                calibrated = calibrator.calibrate(feats)
+                    if calibrator.is_calibrated:
+                        b = calibrator.baseline
 
-            window_feats = window_factory.push(calibrated)
+                        # ── G4: Validar qualidade da calibração ───────────
+                        verdict = validate_calibration(b)
 
-            status_text = "Calibrated - waiting for window..."
-            color = (255, 255, 255)
-            overlay2 = ""
-
-            if window_feats is not None:
-                vec_raw = np.array(
-                    [window_feats[name] for name in feature_names],
-                    dtype=np.float32,
-                )
-
-                if debug:
-                    print("\n[debug] Raw feature vector:")
-                    for i, name in enumerate(feature_names):
-                        print(f"  {name:30s} = {vec_raw[i]:12.6f}")
-
-                # ── 1. Scaler PRIMEIRO ───────────────────────────────
-                vec = scale_features(vec_raw, config)
-
-                if debug:
-                    print("[debug] After scale_features:")
-                    for i, name in enumerate(feature_names):
-                        print(f"  {name:30s} = {vec[i]:12.6f}")
-
-                # ── 2. FIX-RT-3: Neutralizar DEPOIS do scaler (C33) ─
-                vec = neutralizer.neutralize(vec)
-
-                if debug and neutralizer.enabled:
-                    print("[debug] After HeadPoseNeutralizer:")
-                    for i, name in enumerate(feature_names):
-                        print(f"  {name:30s} = {vec[i]:12.6f}")
-                # ─────────────────────────────────────────────────────
-
-                # ── 3. Predição ──────────────────────────────────────
-                prob_danger, label = predict_fatigue(
-                    vec, model, config, threshold_override=threshold
-                )
-
-                # ── 4. Guardrails: validar e empacotar saída ─────────
-                output = guardrails.validate_and_wrap(
-                    prob_danger=prob_danger,
-                    label=label,
-                    window_feats=window_feats,
-                    feature_names=feature_names,
-                    config=config,
-                    timestamp_ms=calibrated.timestamp_ms,
-                    threshold=threshold,
-                )
-                output = behavior_guard.process(output)
-
-                # ── 5. Reflection: drift + predição ──────────────────
-                drift_report = drift_reflector.push_window(window_feats)
-                reflection = pred_reflector.push(prob_danger, label)
-
-                if reflection.pattern != "stable":
-                    print(
-                        f"[reflection] Padrão: {reflection.pattern} | "
-                        f"{reflection.suggestion}"
-                    )
-
-                if reflection.confidence_modifier < 1.0:
-                    output.confidence = "low"
-
-                if drift_report is not None:
-                    if drift_report.status != DriftStatus.STABLE:
-                        print(
-                            f"[reflection] Drift {drift_report.status.value}: "
-                            f"{drift_report.drifted_features}"
-                        )
-                        print(
-                            f"[reflection] Z-scores: "
-                            f"{drift_report.details}"
-                        )
-                        print(
-                            f"[reflection] Recomendação: "
-                            f"{drift_report.recommendation}"
-                        )
-
-                    # ── 6. Auto-recalibração ─────────────────────────
-                    recal_decision = recal_manager.evaluate(
-                        drift_report=drift_report,
-                        pred_reflection=reflection,
-                    )
-
-                    if recal_decision.should_recalibrate:
-                        print(
-                            f"[reflection] AUTO-RECALIBRAÇÃO: "
-                            f"{recal_decision.reason} "
-                            f"(urgência: {recal_decision.urgency})"
-                        )
-
-                        session.on_auto_recalibration()
-
-                        if recal_decision.urgency == "immediate":
+                        if verdict.recommendation == "retry":
+                            print(
+                                f"[guardrail] Calibração REJEITADA: "
+                                f"{verdict.issues}"
+                            )
+                            print("[guardrail] Reiniciando warm-up...")
                             calibrator = RTSubjectCalibrator(
                                 CalibrationConfig(
-                                    fps=fps, search_sec=60.0
+                                    fps=fps, search_sec=warmup_sec
                                 )
                             )
-                            window_factory = OnlineWindowFactory(
-                                RTWindowConfig(fps=fps)
+                            continue
+
+                        if verdict.recommendation == "use_with_caution":
+                            print(
+                                "[guardrail] Calibração ACEITA com ressalvas:"
                             )
-                            drift_reflector = DriftReflector(
-                                training_stats
+                            for issue in verdict.issues:
+                                print(f"  [guardrail] {issue}")
+                        # ──────────────────────────────────────────────────
+
+                        print("[calibration] Baseline computed!")
+                        print(
+                            f"[calibration]   EAR:   mean={b.ear_mean:.4f}, "
+                            f"std={b.ear_std:.4f}"
+                        )
+                        print(
+                            f"[calibration]   EAR P90 (debug): {b.ear_p90_raw:.4f}"
+                        )
+                        pf = window_factory.cfg.perclos_factor
+                        print(
+                            f"[calibration]   PERCLOS baseline (=ear_mean): "
+                            f"{b.ear_mean:.4f}"
+                        )
+                        print(
+                            f"[calibration]   PERCLOS factor: {pf} "
+                            f"(offline=0.80, RT=0.65)"
+                        )
+                        print(
+                            f"[calibration]   PERCLOS threshold "
+                            f"(mean*{pf}): {b.ear_mean * pf:.4f}"
+                        )
+                        print(
+                            f"[calibration]   MAR:   mean={b.mar_mean:.4f}, "
+                            f"std={b.mar_std:.4f}"
+                        )
+                        print(
+                            f"[calibration]   Pitch: mean={b.pitch_mean:.2f}, "
+                            f"std={b.pitch_std:.2f}"
+                        )
+                        print(
+                            f"[calibration]   Yaw:   mean={b.yaw_mean:.2f}, "
+                            f"std={b.yaw_std:.2f}"
+                        )
+                        print(
+                            f"[calibration]   Roll:  mean={b.roll_mean:.2f}, "
+                            f"std={b.roll_std:.2f}"
+                        )
+                        print(f"[calibration]   Valid: {b.is_valid}")
+                        print(
+                            f"[calibration]   Segment: frames "
+                            f"{b.segment_start}-{b.segment_end}"
+                        )
+
+                        behavior_guard.on_calibration_complete()
+
+                        # ── Memory: registrar calibração ──────────────────
+                        session.on_calibration(
+                            b.ear_mean, verdict.recommendation,
+                        )
+                        op_store.upsert_profile_from_calibration(
+                            _op_id, b,
+                        )
+                        # ──────────────────────────────────────────────────
+
+                        window_factory.set_perclos_baseline(b.ear_mean)
+                    else:
+                        if not headless:
+                            _draw_warmup_overlay(
+                                frame, progress, warmup_sec,
+                                len(calibrator._warmup_buffer) / fps,
+                                raw_text,
                             )
-                            pred_reflector = PredictionReflector()
-                            behavior_guard.on_calibration_complete()
-                # ─────────────────────────────────────────────────────
+                            cv2.imshow("SALTE Realtime Demo", frame)
 
-                # Sound alert with rate limiting
-                alert_triggered = behavior_guard.should_sound_alert(
-                    output
-                )
-                if alert_triggered:
-                    print("[alert] SOUND ALERT triggered")
-                session.on_alert(triggered=alert_triggered)
+                        if key == ord("q"):
+                            break
+                        continue
 
-                # ── Memory: registrar janela ─────────────────────────
-                session.on_window(
-                    label=output.label,
-                    prob_danger=output.prob_danger,
-                    alert_level_name=output.alert_level.name,
-                    perclos=output.perclos,
-                    ear_mean=window_feats.get("ear_mean", 0.0),
-                    microsleep_count=output.microsleep_count,
-                    microsleep_total_ms=window_feats.get(
-                        "microsleep_total_ms", 0.0
-                    ),
-                )
-                feat_logger.log(
-                    timestamp_ms=output.timestamp_ms,
-                    label=output.label,
-                    prob_danger=output.prob_danger,
-                    alert_level=output.alert_level.name,
-                    confidence=output.confidence,
-                    window_feats=window_feats,
-                )
-                # ─────────────────────────────────────────────────────
+                    if calibrated is None:
+                        calibrated = calibrator.calibrate(feats)
 
-                # ── Multi-Agent: consultar Supervisor ─────────────────
-                supervisor_decision = None
-                if supervisor is not None:
-                    supervisor_decision = supervisor.decide(window_feats)
+                else:
+                    calibrated = calibrator.calibrate(feats)
+
+                window_feats = window_factory.push(calibrated)
+
+                status_text = "Calibrated - waiting for window..."
+                color = (255, 255, 255)
+                overlay2 = ""
+
+                if window_feats is not None:
+                    vec_raw = np.array(
+                        [window_feats[name] for name in feature_names],
+                        dtype=np.float32,
+                    )
 
                     if debug:
-                        print(f"[agents] MLP: {output.label} ({output.prob_danger:.3f})")
-                        print(f"[agents] Supervisor: {supervisor_decision.label} "
-                              f"({supervisor_decision.combined_score:.3f})")
-                        print(f"[agents] Type: {supervisor_decision.fatigue_type}")
-                        print(f"[agents] Dominant: {supervisor_decision.dominant_agent}")
-                        print(f"[agents] Agreement: {supervisor_decision.agent_agreement:.2f}")
-                        for op in supervisor_decision.opinions:
-                            print(f"[agents]   {op.agent_name}: {op.signal.name} "
-                                  f"(score={op.score:.3f}, conf={op.confidence:.2f})")
-                            print(f"[agents]     → {op.reasoning}")
-                # ─────────────────────────────────────────────────────
+                        print("\n[debug] Raw feature vector:")
+                        for i, name in enumerate(feature_names):
+                            print(f"  {name:30s} = {vec_raw[i]:12.6f}")
 
-                status_text = (
-                    f"{output.label} ({output.prob_danger:.2f}) "
-                    f"[{output.confidence}]"
-                )
-                color = (0, 0, 255) if output.label == "Danger" else (0, 255, 0)
-                if output.alert_level == AlertLevel.CRITICAL:
-                    color = (0, 0, 200)  # dark red for critical
-                elif output.alert_level == AlertLevel.WATCH:
-                    color = (0, 165, 255)  # orange for watch
+                    vec = scale_features(vec_raw, config)
 
-                overlay2 = (
-                    f"PERCLOS:{output.perclos:.2f} "
-                    f"BlinkCount:{output.blink_count:.1f} "
-                    f"Microsleeps:{output.microsleep_count:.1f} "
-                    f"Alert:{output.alert_level.name}"
-                )
-                if (supervisor_decision is not None
-                        and supervisor_decision.fatigue_type != "none"):
-                    overlay2 += f" Type:{supervisor_decision.fatigue_type}"
+                    if debug:
+                        print("[debug] After scale_features:")
+                        for i, name in enumerate(feature_names):
+                            print(f"  {name:30s} = {vec[i]:12.6f}")
 
-                print(
-                    f"[window] label={output.label} "
-                    f"prob={output.prob_danger:.3f} "
-                    f"alert={output.alert_level.name} "
-                    f"ear_mean_z={window_feats.get('ear_mean', 0.0):.3f} "
-                    f"perclos={output.perclos:.3f} "
-                    f"blinks={output.blink_count:.0f} "
-                    f"microsleeps={output.microsleep_count:.0f} "
-                    f"confidence={output.confidence}"
-                )
+                    vec = neutralizer.neutralize(vec)
 
+                    if debug and neutralizer.enabled:
+                        print("[debug] After HeadPoseNeutralizer:")
+                        for i, name in enumerate(feature_names):
+                            print(f"  {name:30s} = {vec[i]:12.6f}")
+
+                    prob_danger, label = predict_fatigue(
+                        vec, model, config, threshold_override=threshold
+                    )
+
+                    output = guardrails.validate_and_wrap(
+                        prob_danger=prob_danger,
+                        label=label,
+                        window_feats=window_feats,
+                        feature_names=feature_names,
+                        config=config,
+                        timestamp_ms=calibrated.timestamp_ms,
+                        threshold=threshold,
+                    )
+                    output = behavior_guard.process(output)
+
+                    drift_report = drift_reflector.push_window(window_feats)
+                    reflection = pred_reflector.push(prob_danger, label)
+
+                    if reflection.pattern != "stable":
+                        print(
+                            f"[reflection] Padrão: {reflection.pattern} | "
+                            f"{reflection.suggestion}"
+                        )
+
+                    if reflection.confidence_modifier < 1.0:
+                        output.confidence = "low"
+
+                    if drift_report is not None:
+                        if drift_report.status != DriftStatus.STABLE:
+                            print(
+                                f"[reflection] Drift {drift_report.status.value}: "
+                                f"{drift_report.drifted_features}"
+                            )
+                            print(
+                                f"[reflection] Z-scores: "
+                                f"{drift_report.details}"
+                            )
+                            print(
+                                f"[reflection] Recomendação: "
+                                f"{drift_report.recommendation}"
+                            )
+
+                        recal_decision = recal_manager.evaluate(
+                            drift_report=drift_report,
+                            pred_reflection=reflection,
+                        )
+
+                        if recal_decision.should_recalibrate:
+                            print(
+                                f"[reflection] AUTO-RECALIBRAÇÃO: "
+                                f"{recal_decision.reason} "
+                                f"(urgência: {recal_decision.urgency})"
+                            )
+
+                            session.on_auto_recalibration()
+
+                            if recal_decision.urgency == "immediate":
+                                calibrator = RTSubjectCalibrator(
+                                    CalibrationConfig(
+                                        fps=fps, search_sec=60.0
+                                    )
+                                )
+                                window_factory = OnlineWindowFactory(
+                                    RTWindowConfig(fps=fps)
+                                )
+                                drift_reflector = DriftReflector(
+                                    training_stats
+                                )
+                                pred_reflector = PredictionReflector()
+                                behavior_guard.on_calibration_complete()
+
+                    alert_triggered = behavior_guard.should_sound_alert(
+                        output
+                    )
+                    if alert_triggered:
+                        print("[alert] SOUND ALERT triggered")
+                    session.on_alert(triggered=alert_triggered)
+
+                    session.on_window(
+                        label=output.label,
+                        prob_danger=output.prob_danger,
+                        alert_level_name=output.alert_level.name,
+                        perclos=output.perclos,
+                        ear_mean=window_feats.get("ear_mean", 0.0),
+                        microsleep_count=output.microsleep_count,
+                        microsleep_total_ms=window_feats.get(
+                            "microsleep_total_ms", 0.0
+                        ),
+                    )
+                    feat_logger.log(
+                        timestamp_ms=output.timestamp_ms,
+                        label=output.label,
+                        prob_danger=output.prob_danger,
+                        alert_level=output.alert_level.name,
+                        confidence=output.confidence,
+                        window_feats=window_feats,
+                    )
+
+                    supervisor_decision = None
+                    if supervisor is not None:
+                        supervisor_decision = supervisor.decide(window_feats)
+
+                        if debug:
+                            print(f"[agents] MLP: {output.label} ({output.prob_danger:.3f})")
+                            print(f"[agents] Supervisor: {supervisor_decision.label} "
+                                  f"({supervisor_decision.combined_score:.3f})")
+                            print(f"[agents] Type: {supervisor_decision.fatigue_type}")
+                            print(f"[agents] Dominant: {supervisor_decision.dominant_agent}")
+                            print(f"[agents] Agreement: {supervisor_decision.agent_agreement:.2f}")
+                            for op in supervisor_decision.opinions:
+                                print(f"[agents]   {op.agent_name}: {op.signal.name} "
+                                      f"(score={op.score:.3f}, conf={op.confidence:.2f})")
+                                print(f"[agents]     → {op.reasoning}")
+
+                    status_text = (
+                        f"{output.label} ({output.prob_danger:.2f}) "
+                        f"[{output.confidence}]"
+                    )
+                    color = (0, 0, 255) if output.label == "Danger" else (0, 255, 0)
+                    if output.alert_level == AlertLevel.CRITICAL:
+                        color = (0, 0, 200)
+                    elif output.alert_level == AlertLevel.WATCH:
+                        color = (0, 165, 255)
+
+                    overlay2 = (
+                        f"PERCLOS:{output.perclos:.2f} "
+                        f"BlinkCount:{output.blink_count:.1f} "
+                        f"Microsleeps:{output.microsleep_count:.1f} "
+                        f"Alert:{output.alert_level.name}"
+                    )
+                    if (supervisor_decision is not None
+                            and supervisor_decision.fatigue_type != "none"):
+                        overlay2 += f" Type:{supervisor_decision.fatigue_type}"
+
+                    print(
+                        f"[window] label={output.label} "
+                        f"prob={output.prob_danger:.3f} "
+                        f"alert={output.alert_level.name} "
+                        f"ear_mean_z={window_feats.get('ear_mean', 0.0):.3f} "
+                        f"perclos={output.perclos:.3f} "
+                        f"blinks={output.blink_count:.0f} "
+                        f"microsleeps={output.microsleep_count:.0f} "
+                        f"confidence={output.confidence}"
+                    )
+
+                if not headless:
+                    _draw_inference_overlay(
+                        frame, status_text, color, raw_text,
+                        overlay2, calibrator, calibrated,
+                    )
+                    cv2.imshow("SALTE Realtime Demo", frame)
+
+                if key == ord("q"):
+                    break
+
+        finally:
+            cap.release()
             if not headless:
-                _draw_inference_overlay(
-                    frame, status_text, color, raw_text,
-                    overlay2, calibrator, calibrated,
-                )
-                cv2.imshow("SALTE Realtime Demo", frame)
-                if perf_monitor is not None:
-                    perf_monitor.on_display()
+                cv2.destroyAllWindows()
 
-            # ── Perf: periodic report ─────────────────────────────────
-            if perf_monitor is not None and grabber is not None:
-                perf_monitor.maybe_report(
-                    grabber.stats,
-                    {"avg_process_ms": 0, "frames_processed": 0},
-                )
+            # ── Memory: salvar sessão e fechar ────────────────────────
+            summary = session.summary()
+            print(f"[session] Resumo final: {summary}")
+            op_store.save_session(_op_id, summary, session_started_at)
+            op_store.close()
+            feat_logger.close()
+            print(f"[memory] Sessão salva para {_op_id}")
             # ──────────────────────────────────────────────────────────
-
-            if key == ord("q"):
-                break
-
-    finally:
-        if grabber is not None:
-            grabber.stop()
-        cap.release()
-        if not headless:
-            cv2.destroyAllWindows()
-
-        # ── Memory: salvar sessão e fechar ────────────────────────────
-        summary = session.summary()
-        print(f"[session] Resumo final: {summary}")
-        op_store.save_session(_op_id, summary, session_started_at)
-        op_store.close()
-        feat_logger.close()
-        print(f"[memory] Sessão salva para {_op_id}")
-        # ──────────────────────────────────────────────────────────────
 
 
 # ── Overlay drawing helpers ──────────────────────────────────────────────────
@@ -756,6 +1104,38 @@ def _draw_inference_overlay(
             f"MAR_z:{calibrated.mar_znorm:.2f} "
             f"Pitch_z:{calibrated.head_pitch_znorm:.2f}"
         )
+        cv2.putText(
+            frame, znorm_text, (16, 96),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 255), 1, cv2.LINE_AA,
+        )
+
+    if overlay2:
+        cv2.putText(
+            frame, overlay2, (16, 128),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2, cv2.LINE_AA,
+        )
+
+
+def _draw_inference_overlay_parallel(
+    frame: np.ndarray,
+    status_text: str,
+    color: tuple[int, int, int],
+    raw_text: str,
+    overlay2: str,
+    znorm_text: str,
+    is_calibrated: bool,
+) -> None:
+    """Overlay para modo paralelo — usa znorm_text do PipelineResult."""
+    cv2.putText(
+        frame, status_text, (16, 32),
+        cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2, cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame, raw_text, (16, 64),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA,
+    )
+
+    if is_calibrated and znorm_text:
         cv2.putText(
             frame, znorm_text, (16, 96),
             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 255), 1, cv2.LINE_AA,

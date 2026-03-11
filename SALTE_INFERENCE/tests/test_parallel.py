@@ -248,3 +248,101 @@ class TestPerformanceMonitorP3:
         )
         assert report is not None
         assert "Latency:" in report
+
+
+# ── P2 Integration: PipelineWorker with process_fn ──────────────────────
+
+
+class TestPipelineWorkerIntegrationP2:
+    """Testes do PipelineWorker com process_fn simulando o pipeline real."""
+
+    def test_worker_returns_warmup_result(self):
+        """process_fn que simula warmup retorna PipelineResult(is_warmup=True)."""
+        def fake_process(frame):
+            return PipelineResult(
+                frame=frame, raw_text="EAR:0.3", status_text="Calibrating...",
+                color=(0, 200, 255), overlay2="",
+                is_warmup=True, warmup_progress=0.5, warmup_elapsed=10.0,
+            )
+        worker = PipelineWorker(fake_process)
+        worker.start()
+        worker.put_frame(np.zeros((480, 640, 3), dtype=np.uint8))
+        time.sleep(0.1)
+        result = worker.get_result(timeout=0.5)
+        worker.stop()
+        assert result is not None
+        assert result.is_warmup is True
+        assert result.warmup_progress == 0.5
+
+    def test_worker_returns_inference_result(self):
+        """process_fn que simula inferência retorna PipelineResult com output."""
+        def fake_process(frame):
+            return PipelineResult(
+                frame=frame, raw_text="EAR:0.3",
+                status_text="Safe (0.20) [high]",
+                color=(0, 255, 0), overlay2="Alert:SAFE",
+                is_warmup=False,
+                znorm_text="EAR_z:0.12 MAR_z:-0.34",
+                is_calibrated=True,
+            )
+        worker = PipelineWorker(fake_process)
+        worker.start()
+        worker.put_frame(np.zeros((10, 10, 3), dtype=np.uint8))
+        time.sleep(0.1)
+        result = worker.get_result(timeout=0.5)
+        worker.stop()
+        assert result is not None
+        assert result.is_warmup is False
+        assert result.is_calibrated is True
+        assert "EAR_z" in result.znorm_text
+
+    def test_force_calibrate_event(self):
+        """threading.Event propaga corretamente entre threads."""
+        import threading
+        event = threading.Event()
+        assert not event.is_set()
+        event.set()
+        assert event.is_set()
+        event.clear()
+        assert not event.is_set()
+
+    def test_worker_stats_reflect_real_processing(self):
+        """worker.stats tem avg_process_ms > 0 após processar frames."""
+        def slow_process(frame):
+            time.sleep(0.01)
+            return PipelineResult(
+                frame=frame, raw_text="", status_text="",
+                color=(0, 0, 0), overlay2="",
+            )
+        worker = PipelineWorker(slow_process)
+        worker.start()
+        for _ in range(3):
+            worker.put_frame(np.zeros((10, 10, 3), dtype=np.uint8))
+            time.sleep(0.05)
+        time.sleep(0.2)
+        stats = worker.stats
+        worker.stop()
+        assert stats["frames_processed"] >= 1
+        assert stats["avg_process_ms"] > 0
+
+    def test_pipeline_result_new_fields(self):
+        """PipelineResult tem os novos campos znorm_text e is_calibrated."""
+        result = PipelineResult(
+            frame=np.zeros((10, 10, 3), dtype=np.uint8),
+            raw_text="test", status_text="test",
+            color=(0, 0, 0), overlay2="",
+            znorm_text="EAR_z:0.5",
+            is_calibrated=True,
+        )
+        assert result.znorm_text == "EAR_z:0.5"
+        assert result.is_calibrated is True
+
+    def test_pipeline_result_default_fields(self):
+        """PipelineResult defaults: znorm_text='', is_calibrated=False."""
+        result = PipelineResult(
+            frame=np.zeros((10, 10, 3), dtype=np.uint8),
+            raw_text="test", status_text="test",
+            color=(0, 0, 0), overlay2="",
+        )
+        assert result.znorm_text == ""
+        assert result.is_calibrated is False

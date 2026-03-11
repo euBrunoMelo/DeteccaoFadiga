@@ -145,6 +145,8 @@ class PipelineResult:
     is_warmup: bool = False
     warmup_progress: float = 0.0
     warmup_elapsed: float = 0.0
+    znorm_text: str = ""               # "EAR_z:0.12 MAR_z:-0.34 Pitch_z:0.01"
+    is_calibrated: bool = False
 
 
 class PipelineWorker:
